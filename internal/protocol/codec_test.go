@@ -167,6 +167,27 @@ func TestStateModificationVariantsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateModificationQueryUpdatedNullValue(t *testing.T) {
+	// Convex legitimately sends QueryUpdated with value=null when a query
+	// returns no results. The SDK must accept this instead of erroring,
+	// which previously caused an infinite WebSocket reconnect loop.
+	raw := []byte(`{"type":"QueryUpdated","queryId":1,"value":null}`)
+	var mod StateModification
+	if err := json.Unmarshal(raw, &mod); err != nil {
+		t.Fatalf("query updated with null value should not error: %v", err)
+	}
+	data, ok := mod.QueryUpdated()
+	if !ok {
+		t.Fatalf("expected query updated variant")
+	}
+	if string(data.Value) != "null" {
+		t.Fatalf("expected value to be literal 'null', got %q", string(data.Value))
+	}
+	if data.QueryID != NewQueryID(1) {
+		t.Fatalf("unexpected query id: %d", data.QueryID)
+	}
+}
+
 func TestStateModificationRejectsMalformedVariant(t *testing.T) {
 	raw := []byte(`{"type":"QueryFailed","queryId":1}`)
 	var output StateModification

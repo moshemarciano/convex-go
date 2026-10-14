@@ -336,6 +336,8 @@ func (mod *StateModification) UnmarshalJSON(data []byte) error {
 			// and pending server-side transitions). Go's JSON decoder maps
 			// both "value":null and absent "value" to *json.RawMessage=nil,
 			// so we treat nil as JSON null — a valid Convex value.
+			// (Supersedes the equivalent fix from fix/query-updated-null-value;
+			// its regression test lives in internal/protocol/codec_test.go.)
 			nullVal := json.RawMessage("null")
 			payload.Value = &nullVal
 		}
