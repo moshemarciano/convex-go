@@ -966,6 +966,7 @@ func (c *Client) handleTransition(message protocol.ServerMessage) {
 			if !ok {
 				continue
 			}
+			log.Printf("[CONVEX-SDK] query failed server-side: %s", failed.ErrorMessage)
 			queryID := failed.QueryID.Uint64()
 			for subID := range c.querySubscribers[queryID] {
 				if ch, ok := c.querySubs[subID]; ok {
