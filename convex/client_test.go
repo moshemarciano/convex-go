@@ -84,8 +84,8 @@ func TestOutboundFunctionArgsAreArrayWrapped(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected mutation count encoded as object, got %#v", firstMutationArg["count"])
 	}
-	if got := count["$integer"]; got != "1" {
-		t.Fatalf("expected integer wire encoding %q, got %#v", "1", got)
+	if got := count["$integer"]; got != "AQAAAAAAAAA=" {
+		t.Fatalf("expected integer wire encoding %q, got %#v", "AQAAAAAAAAA=", got)
 	}
 }
 
