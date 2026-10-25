@@ -1,6 +1,7 @@
 package baseclient
 
 import (
+    "encoding/base64"
     "encoding/json"
     "fmt"
     "sort"
@@ -190,7 +191,19 @@ func canonicalJSON(v any) (string, error) {
             parts = append(parts, fmt.Sprintf("%s:%s", string(kb), c))
         }
         return "{" + strings.Join(parts, ",") + "}", nil
+    case []byte:
+        return fmt.Sprintf(`{"$bytes":%q}`, base64.StdEncoding.EncodeToString(t)), nil
     default:
-        return "", fmt.Errorf("unsupported canonical type %T", v)
+        return canonicalTyped(v)
     }
+}
+
+// canonicalTyped canonicalises typed slices, maps, pointers and named scalars
+// by normalising them to the base shapes handled by canonicalJSON.
+func canonicalTyped(v any) (string, error) {
+    n, err := NormalizeValue(v)
+    if err != nil {
+        return "", fmt.Errorf("unsupported canonical type %T: %w", v, err)
+    }
+    return canonicalJSON(n)
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/get-convex/convex-go/internal/baseclient"
 )
 
 type Value struct {
@@ -93,8 +95,19 @@ func encodeRaw(input any) (any, error) {
 	case Value:
 		return encodeRaw(t.raw)
 	default:
-		return nil, fmt.Errorf("unsupported value type %T", input)
+		return encodeTyped(input)
 	}
+}
+
+// encodeTyped handles typed slices, maps, pointers and named scalars (for
+// example []string or map[string]string) by normalising them to the base
+// shapes that encodeRaw understands.
+func encodeTyped(input any) (any, error) {
+	n, err := baseclient.NormalizeValue(input)
+	if err != nil {
+		return nil, err
+	}
+	return encodeRaw(n)
 }
 
 // encodeInt64 returns the Convex Int64 wire form: base64 of the 8-byte
