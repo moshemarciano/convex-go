@@ -1083,6 +1083,17 @@ func (c *Client) handleActionResponse(message protocol.ServerMessage) {
 	delete(c.pending, message.RequestID)
 }
 
+// errorKind names the Go type at the root of err's wrap chain, never its text.
+func errorKind(err error) string {
+	for {
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			return fmt.Sprintf("%T", err)
+		}
+		err = inner
+	}
+}
+
 func (c *Client) onProtocolFailure(err error) {
 	if err == nil {
 		err = errors.New("unknown protocol failure")
@@ -1095,7 +1106,8 @@ func (c *Client) onProtocolFailure(err error) {
 	}
 
 	// Always log the failure reason — critical for debugging reconnect storms.
-	log.Printf("[CONVEX-SDK] onProtocolFailure: %s (outbound=%d)", err.Error(), len(c.outboundQueue))
+	// Only the error kind is logged: the text may carry server-supplied data.
+	log.Printf("[CONVEX-SDK] onProtocolFailure: kind=%s (outbound=%d)", errorKind(err), len(c.outboundQueue))
 
 	c.connected = false
 	c.reconnecting = true

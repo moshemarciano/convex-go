@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
@@ -40,6 +42,34 @@ func TestQueryFailedLogHoldsNoServerText(t *testing.T) {
 	}
 	if strings.Contains(out, "SERVER-ECHOED-SECRET") || strings.Contains(out, "serviceToken") {
 		t.Fatalf("log holds server text: %q", out)
+	}
+}
+
+func TestProtocolFailureLogHoldsNoServerText(t *testing.T) {
+	cases := map[string]error{
+		"close reason":    errors.New("websocket: close 1008 (policy violation): " + serverSecretText),
+		"wrapped chunk":   fmt.Errorf("transition chunk: %w", errors.New(serverSecretText)),
+		"unknown message": fmt.Errorf("unknown server message type: %s", serverSecretText),
+	}
+	for name, cause := range cases {
+		t.Run(name, func(t *testing.T) {
+			buf := captureStdLog(t)
+			client := newClient()
+			client.mu.Lock()
+			client.connected = true
+			client.reconnectFn = func(context.Context, syncproto.ReconnectRequest) error { return nil }
+			client.mu.Unlock()
+
+			client.onProtocolFailure(cause)
+
+			out := buf.String()
+			if !strings.Contains(out, "onProtocolFailure") {
+				t.Fatalf("failure not logged: %q", out)
+			}
+			if strings.Contains(out, "SERVER-ECHOED-SECRET") || strings.Contains(out, "serviceToken") {
+				t.Fatalf("log holds server text: %q", out)
+			}
+		})
 	}
 }
 
