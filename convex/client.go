@@ -858,9 +858,10 @@ func (c *Client) handleServerMessage(message protocol.ServerMessage) {
 	case "Ping":
 		return
 	case "AuthError":
-		c.onProtocolFailure(fmt.Errorf("auth error: %s", message.Error))
+		// Server text can echo submitted args (credentials): keep the kind only.
+		c.onProtocolFailure(errors.New("auth error (server message withheld)"))
 	case "FatalError":
-		c.onProtocolFailure(fmt.Errorf("fatal error: %s", message.Error))
+		c.onProtocolFailure(errors.New("fatal error (server message withheld)"))
 	case "TransitionChunk":
 		c.handleTransitionChunk(message)
 	default:
@@ -966,7 +967,8 @@ func (c *Client) handleTransition(message protocol.ServerMessage) {
 			if !ok {
 				continue
 			}
-			log.Printf("[CONVEX-SDK] query failed server-side: %s", failed.ErrorMessage)
+			// Server error text can echo submitted args (credentials): log the kind only.
+			log.Printf("[CONVEX-SDK] query failed server-side (error text withheld) query_id=%d", failed.QueryID.Uint64())
 			queryID := failed.QueryID.Uint64()
 			for subID := range c.querySubscribers[queryID] {
 				if ch, ok := c.querySubs[subID]; ok {
