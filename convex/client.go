@@ -44,6 +44,14 @@ type Client struct {
 	mu         sync.Mutex
 	replayDone *sync.Cond // signaled when reconnecting transitions to false
 
+	// connectMu single-flights the INITIAL open inside ensureConnected: N
+	// concurrent callers on a disconnected client must produce exactly one
+	// dial. Without it, every racer passed the connected=false check, each
+	// opened a WebSocket, and the last open silently replaced the others
+	// (leaking their readLoops). Steady-state calls (connected=true) never
+	// take it — only the first dial does.
+	connectMu sync.Mutex
+
 	closed        bool
 	reconnecting  bool
 	deploymentURL string
@@ -57,6 +65,9 @@ type Client struct {
 	manager         *syncproto.WebSocketManager
 	sendFn          func(context.Context, protocol.ClientMessage) error
 	reconnectFn     func(context.Context, syncproto.ReconnectRequest) error
+	// openFn runs one manager open (the dial). nil means manager.Open; tests
+	// inject a fake to observe how many dials concurrent callers produce.
+	openFn func(ctx context.Context, manager *syncproto.WebSocketManager, request syncproto.ReconnectRequest) (<-chan syncproto.ProtocolResponse, error)
 	responses       <-chan syncproto.ProtocolResponse
 	workerStarted   bool
 	workerCommands  chan workerCommand
@@ -350,6 +361,14 @@ func (c *Client) unsubscribe(subID int64) {
 	}
 }
 
+// openConnVia runs one manager open through the injected hook (or manager.Open).
+func (c *Client) openConnVia(ctx context.Context, manager *syncproto.WebSocketManager) (<-chan syncproto.ProtocolResponse, error) {
+	if c.openFn != nil {
+		return c.openFn(ctx, manager, syncproto.ReconnectRequest{})
+	}
+	return manager.Open(ctx, syncproto.ReconnectRequest{})
+}
+
 func (c *Client) ensureConnected(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -376,6 +395,35 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	if deploymentURL == "" {
 		return fmt.Errorf("deployment URL is required; use WithDeploymentURL")
 	}
+
+	// Single-flight the open. Re-check state under connectMu: another
+	// goroutine may have connected (or entered the reconnectLoop) while we
+	// waited for the lock — its connection is then the shared one.
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("client closed")
+	}
+	if c.connected {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.reconnecting {
+		// A protocol-failure reconnectLoop owns the connection: wait for its
+		// replay instead of dialing a second WebSocket.
+		c.replayDone.Wait()
+		stillReconnecting := c.reconnecting
+		c.mu.Unlock()
+		if stillReconnecting {
+			return fmt.Errorf("client still reconnecting")
+		}
+		return nil
+	}
+	c.mu.Unlock()
+
 	c.emitState(WebSocketStateConnecting)
 	wsURL, err := syncproto.DeploymentURLToWebSocketURL(deploymentURL)
 	if err != nil {
@@ -390,7 +438,7 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	manager := c.manager
 	c.mu.Unlock()
 
-	responses, err := manager.Open(ctx, syncproto.ReconnectRequest{})
+	responses, err := c.openConnVia(ctx, manager)
 	if err != nil {
 		return err
 	}
