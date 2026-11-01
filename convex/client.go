@@ -44,13 +44,15 @@ type Client struct {
 	mu         sync.Mutex
 	replayDone *sync.Cond // signaled when reconnecting transitions to false
 
-	// connectMu single-flights the INITIAL open inside ensureConnected: N
-	// concurrent callers on a disconnected client must produce exactly one
-	// dial. Without it, every racer passed the connected=false check, each
-	// opened a WebSocket, and the last open silently replaced the others
-	// (leaking their readLoops). Steady-state calls (connected=true) never
-	// take it — only the first dial does.
-	connectMu sync.Mutex
+	// connect single-flights the INITIAL open inside ensureConnected (guarded
+	// by mu): N concurrent callers on a disconnected client must produce
+	// exactly one dial. The first caller becomes the leader and dials; the
+	// rest join the attempt and select on their own ctx.Done() while waiting,
+	// so an outage with deadline-bounded callers never serializes them
+	// dial-by-dial. The leader's result (success or error) is shared with all
+	// joiners via the closed done channel. Steady-state calls
+	// (connected=true) never touch it — only the first dial does.
+	connect *connectAttempt
 
 	closed        bool
 	reconnecting  bool
@@ -369,6 +371,14 @@ func (c *Client) openConnVia(ctx context.Context, manager *syncproto.WebSocketMa
 	return manager.Open(ctx, syncproto.ReconnectRequest{})
 }
 
+// connectAttempt is one in-flight initial-open (dial). The leader performs
+// the dial and publishes its result; joiners wait on done and read err after
+// it closes (the write happens before the close, so no extra lock is needed).
+type connectAttempt struct {
+	done chan struct{}
+	err  error
+}
+
 func (c *Client) ensureConnected(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -376,54 +386,89 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 		return fmt.Errorf("client closed")
 	}
 	if c.connected {
-		if c.reconnecting {
-			// WebSocket is up but replayState is still running.
-			// Block until reconnectLoop broadcasts completion.
-			c.replayDone.Wait()
-			if c.reconnecting {
-				return fmt.Errorf("client still reconnecting")
-			}
+		reconnecting := c.reconnecting
+		c.mu.Unlock()
+		if !reconnecting {
 			return nil
 		}
+		// WebSocket is up but replayState is still running. Wait for the
+		// reconnectLoop's completion broadcast — honouring the caller's ctx,
+		// since the loop may keep retrying for a long time during an outage.
+		if err := c.waitReplayDoneCtx(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		still := c.reconnecting
 		c.mu.Unlock()
-		return nil
-	}
-	deploymentURL := c.deploymentURL
-	clientID := c.clientID
-	c.mu.Unlock()
-
-	if deploymentURL == "" {
-		return fmt.Errorf("deployment URL is required; use WithDeploymentURL")
-	}
-
-	// Single-flight the open. Re-check state under connectMu: another
-	// goroutine may have connected (or entered the reconnectLoop) while we
-	// waited for the lock — its connection is then the shared one.
-	c.connectMu.Lock()
-	defer c.connectMu.Unlock()
-
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return fmt.Errorf("client closed")
-	}
-	if c.connected {
-		c.mu.Unlock()
-		return nil
-	}
-	if c.reconnecting {
-		// A protocol-failure reconnectLoop owns the connection: wait for its
-		// replay instead of dialing a second WebSocket.
-		c.replayDone.Wait()
-		stillReconnecting := c.reconnecting
-		c.mu.Unlock()
-		if stillReconnecting {
+		if still {
 			return fmt.Errorf("client still reconnecting")
 		}
 		return nil
 	}
+
+	// Disconnected: join the in-flight dial, or become its leader.
+	deploymentURL := c.deploymentURL
+	call := c.connect
+	leader := false
+	if call == nil {
+		if deploymentURL == "" {
+			c.mu.Unlock()
+			return fmt.Errorf("deployment URL is required; use WithDeploymentURL")
+		}
+		call = &connectAttempt{done: make(chan struct{})}
+		c.connect = call
+		leader = true
+	}
 	c.mu.Unlock()
 
+	if !leader {
+		// Waiter: the leader's result is ours too — success or shared error.
+		// Never block past the caller's own deadline.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-call.done:
+			return call.err
+		}
+	}
+
+	err := c.dial(ctx, deploymentURL)
+
+	c.mu.Lock()
+	c.connect = nil
+	c.mu.Unlock()
+	call.err = err
+	close(call.done)
+	return err
+}
+
+// waitReplayDoneCtx waits for the replayDone broadcast while honouring ctx.
+// The reconnectLoop may retry for a long time; a deadline-bounded caller
+// must not block on a plain Cond.Wait. A helper goroutine parks on the Cond
+// until the reconnecting state clears; if the caller's ctx expires first the
+// caller gets ctx.Err() and the helper finishes on its own when the
+// broadcast arrives (Close also broadcasts).
+func (c *Client) waitReplayDoneCtx(ctx context.Context) error {
+	finished := make(chan struct{})
+	go func() {
+		c.mu.Lock()
+		for c.reconnecting && !c.closed {
+			c.replayDone.Wait()
+		}
+		c.mu.Unlock()
+		close(finished)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-finished:
+		return nil
+	}
+}
+
+// dial performs one initial open and, on success, installs the connection
+// and starts the worker.
+func (c *Client) dial(ctx context.Context, deploymentURL string) error {
 	c.emitState(WebSocketStateConnecting)
 	wsURL, err := syncproto.DeploymentURLToWebSocketURL(deploymentURL)
 	if err != nil {
@@ -432,6 +477,7 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.wsURL = wsURL
+	clientID := c.clientID
 	if c.manager == nil {
 		c.manager = syncproto.NewWebSocketManager(wsURL, clientID)
 	}

@@ -12,7 +12,7 @@ import (
 
 // TestConcurrentEnsureConnectedDialsOnce pins the single-flight contract of
 // ensureConnected: N concurrent callers on a disconnected client must produce
-// EXACTLY ONE dial. Before the connectMu single-flight, every racer passed the
+// EXACTLY ONE dial. Before the connect single-flight, every racer passed the
 // connected=false check and opened its own WebSocket (openFn counted >1), the
 // second open silently replacing the first conn while its readLoop leaked.
 func TestConcurrentEnsureConnectedDialsOnce(t *testing.T) {
