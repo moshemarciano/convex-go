@@ -263,6 +263,7 @@ func TestEnsureConnectedBlocksUntilReplayCompletes(t *testing.T) {
 	client.mu.Lock()
 	client.connected = true
 	client.reconnecting = true
+	client.replayCh = make(chan struct{})
 	// Set up a reconnectFn so reconnectLoop can succeed
 	client.reconnectFn = func(_ context.Context, _ syncproto.ReconnectRequest) error {
 		return nil
@@ -296,7 +297,10 @@ func TestEnsureConnectedBlocksUntilReplayCompletes(t *testing.T) {
 
 	client.mu.Lock()
 	client.reconnecting = false
-	client.replayDone.Broadcast()
+	if client.replayCh != nil {
+		close(client.replayCh)
+		client.replayCh = nil
+	}
 	client.mu.Unlock()
 
 	replayMu.Lock()
@@ -420,28 +424,32 @@ func TestReplayDoneBroadcastOnClientClose(t *testing.T) {
 	client.mu.Lock()
 	client.connected = true
 	client.reconnecting = true
+	client.replayCh = make(chan struct{})
 	client.mu.Unlock()
 
 	unblocked := make(chan struct{})
 	go func() {
 		client.mu.Lock()
-		for client.reconnecting && !client.closed {
-			client.replayDone.Wait()
-		}
+		ch := client.replayCh
 		client.mu.Unlock()
+		if ch == nil {
+			close(unblocked)
+			return
+		}
+		<-ch
 		close(unblocked)
 	}()
 
-	// Give the goroutine time to enter Wait()
+	// Give the goroutine time to enter the replay wait
 	time.Sleep(50 * time.Millisecond)
 
-	// Close should broadcast and unblock the waiter
+	// Close should close the replay channel and unblock the waiter
 	client.Close()
 
 	select {
 	case <-unblocked:
-		// Good — Close() broadcast and the waiter unblocked
+		// Good — Close() closed the replay channel and the waiter unblocked
 	case <-time.After(2 * time.Second):
-		t.Fatalf("Close() did not unblock replayDone waiters")
+		t.Fatalf("Close() did not unblock replay waiters")
 	}
 }

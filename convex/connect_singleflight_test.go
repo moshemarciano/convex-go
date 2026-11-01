@@ -112,4 +112,3 @@ func TestEnsureConnectedAfterReconnectLoopCompletes(t *testing.T) {
 	}
 	client.Close()
 }
-

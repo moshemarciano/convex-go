@@ -136,7 +136,8 @@ func TestEnsureConnectedHonoursCtxWhileReplaying(t *testing.T) {
 
 	client.mu.Lock()
 	client.connected = true
-	client.reconnecting = true // replay in progress, no broadcast coming
+	client.reconnecting = true            // replay in progress, no broadcast coming
+	client.replayCh = make(chan struct{}) // as onProtocolFailure sets it
 	client.mu.Unlock()
 
 	errs := make(chan error, 1)

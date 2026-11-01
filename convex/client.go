@@ -16,6 +16,11 @@ import (
 	syncproto "github.com/get-convex/convex-go/internal/sync"
 )
 
+// dialTimeout bounds the detached connect dial. 30s covers a slow TLS +
+// WebSocket handshake several times over while capping how long the one
+// shared attempt can hang when the server never answers.
+const dialTimeout = 30 * time.Second
+
 type AuthTokenFetcher func(forceRefresh bool) (*string, error)
 
 type queryRegistration struct {
@@ -41,8 +46,12 @@ type transitionChunkBuffer struct {
 }
 
 type Client struct {
-	mu         sync.Mutex
-	replayDone *sync.Cond // signaled when reconnecting transitions to false
+	mu sync.Mutex
+	// replayCh is non-nil while a protocol-failure replay is in progress and
+	// is CLOSED (and nilled) when the replay completes or the client closes.
+	// A channel (not a Cond) lets replay waiters select on their own ctx —
+	// no helper goroutine parks behind a stuck replay.
+	replayCh chan struct{}
 
 	// connect single-flights the INITIAL open inside ensureConnected (guarded
 	// by mu): N concurrent callers on a disconnected client must produce
@@ -54,22 +63,22 @@ type Client struct {
 	// (connected=true) never touch it — only the first dial does.
 	connect *connectAttempt
 
-	closed        bool
-	reconnecting  bool
-	deploymentURL string
-	wsURL         string
-	clientID      string
-	stateCallback  StateCallback
+	closed          bool
+	reconnecting    bool
+	deploymentURL   string
+	wsURL           string
+	clientID        string
+	stateCallback   StateCallback
 	failureCallback FailureCallback
-	lastState     WebSocketState
-	hasLastState  bool
+	lastState       WebSocketState
+	hasLastState    bool
 
-	manager         *syncproto.WebSocketManager
-	sendFn          func(context.Context, protocol.ClientMessage) error
-	reconnectFn     func(context.Context, syncproto.ReconnectRequest) error
+	manager     *syncproto.WebSocketManager
+	sendFn      func(context.Context, protocol.ClientMessage) error
+	reconnectFn func(context.Context, syncproto.ReconnectRequest) error
 	// openFn runs one manager open (the dial). nil means manager.Open; tests
 	// inject a fake to observe how many dials concurrent callers produce.
-	openFn func(ctx context.Context, manager *syncproto.WebSocketManager, request syncproto.ReconnectRequest) (<-chan syncproto.ProtocolResponse, error)
+	openFn          func(ctx context.Context, manager *syncproto.WebSocketManager, request syncproto.ReconnectRequest) (<-chan syncproto.ProtocolResponse, error)
 	responses       <-chan syncproto.ProtocolResponse
 	workerStarted   bool
 	workerCommands  chan workerCommand
@@ -109,7 +118,6 @@ func newClient() *Client {
 		workerDone:       make(chan struct{}),
 		flushWake:        make(chan struct{}, 1),
 	}
-	c.replayDone = sync.NewCond(&c.mu)
 	return c
 }
 
@@ -297,7 +305,10 @@ func (c *Client) Close() {
 		return
 	}
 	c.closed = true
-	c.replayDone.Broadcast()
+	if c.replayCh != nil {
+		close(c.replayCh)
+		c.replayCh = nil
+	}
 	manager := c.manager
 	workerStarted := c.workerStarted
 	workerDone := c.workerDone
@@ -371,9 +382,11 @@ func (c *Client) openConnVia(ctx context.Context, manager *syncproto.WebSocketMa
 	return manager.Open(ctx, syncproto.ReconnectRequest{})
 }
 
-// connectAttempt is one in-flight initial-open (dial). The leader performs
-// the dial and publishes its result; joiners wait on done and read err after
-// it closes (the write happens before the close, so no extra lock is needed).
+// connectAttempt is one in-flight initial-open (dial). Exactly one goroutine
+// runs the attempt and ALWAYS publishes its result — even on panic — by
+// clearing the attempt, setting err and closing done; joiners read err after
+// done closes (the write happens before the close, so no extra lock is
+// needed).
 type connectAttempt struct {
 	done chan struct{}
 	err  error
@@ -387,15 +400,22 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 	}
 	if c.connected {
 		reconnecting := c.reconnecting
+		replay := c.replayCh
 		c.mu.Unlock()
 		if !reconnecting {
 			return nil
 		}
-		// WebSocket is up but replayState is still running. Wait for the
-		// reconnectLoop's completion broadcast — honouring the caller's ctx,
-		// since the loop may keep retrying for a long time during an outage.
-		if err := c.waitReplayDoneCtx(ctx); err != nil {
-			return err
+		// WebSocket is up but replayState is still running. Wait on the
+		// replay channel — honouring the caller's ctx, since the
+		// reconnectLoop may keep retrying for a long time during an outage.
+		// No helper goroutine: a channel select is enough.
+		if replay == nil {
+			return fmt.Errorf("client still reconnecting")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-replay:
 		}
 		c.mu.Lock()
 		still := c.reconnecting
@@ -406,10 +426,9 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 		return nil
 	}
 
-	// Disconnected: join the in-flight dial, or become its leader.
+	// Disconnected: join the in-flight dial, or start one.
 	deploymentURL := c.deploymentURL
 	call := c.connect
-	leader := false
 	if call == nil {
 		if deploymentURL == "" {
 			c.mu.Unlock()
@@ -417,58 +436,54 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 		}
 		call = &connectAttempt{done: make(chan struct{})}
 		c.connect = call
-		leader = true
+		// The dial is detached from any caller's ctx: it serves the whole
+		// joining batch, so a cancelled first caller must not kill the
+		// attempt for live waiters. dialTimeout bounds the detached dial.
+		dialCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dialTimeout)
+		go func() {
+			defer cancel()
+			func() {
+				var err error
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("dial panicked: %v", r)
+					}
+					c.mu.Lock()
+					if c.connect == call {
+						c.connect = nil
+					}
+					c.mu.Unlock()
+					call.err = err
+					close(call.done)
+				}()
+				err = c.dial(dialCtx, deploymentURL)
+			}()
+		}()
 	}
 	c.mu.Unlock()
 
-	if !leader {
-		// Waiter: the leader's result is ours too — success or shared error.
-		// Never block past the caller's own deadline.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-call.done:
-			return call.err
-		}
-	}
-
-	err := c.dial(ctx, deploymentURL)
-
-	c.mu.Lock()
-	c.connect = nil
-	c.mu.Unlock()
-	call.err = err
-	close(call.done)
-	return err
-}
-
-// waitReplayDoneCtx waits for the replayDone broadcast while honouring ctx.
-// The reconnectLoop may retry for a long time; a deadline-bounded caller
-// must not block on a plain Cond.Wait. A helper goroutine parks on the Cond
-// until the reconnecting state clears; if the caller's ctx expires first the
-// caller gets ctx.Err() and the helper finishes on its own when the
-// broadcast arrives (Close also broadcasts).
-func (c *Client) waitReplayDoneCtx(ctx context.Context) error {
-	finished := make(chan struct{})
-	go func() {
-		c.mu.Lock()
-		for c.reconnecting && !c.closed {
-			c.replayDone.Wait()
-		}
-		c.mu.Unlock()
-		close(finished)
-	}()
+	// Every caller — the one that started the attempt included — waits via
+	// its own ctx: a cancelled caller returns at once, a live one shares the
+	// attempt's result.
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-finished:
-		return nil
+	case <-call.done:
+		return call.err
 	}
 }
 
 // dial performs one initial open and, on success, installs the connection
-// and starts the worker.
+// and starts the worker. A Close landing mid-dial wins: the fresh connection
+// is torn down instead of resurrecting a closed client.
 func (c *Client) dial(ctx context.Context, deploymentURL string) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("client closed")
+	}
+	c.mu.Unlock()
+
 	c.emitState(WebSocketStateConnecting)
 	wsURL, err := syncproto.DeploymentURLToWebSocketURL(deploymentURL)
 	if err != nil {
@@ -490,6 +505,15 @@ func (c *Client) dial(ctx context.Context, deploymentURL string) error {
 	}
 
 	c.mu.Lock()
+	if c.closed {
+		// Close ran while we dialled (possibly before it saw this manager):
+		// tear the fresh socket down instead of installing connected state.
+		c.mu.Unlock()
+		if manager != nil {
+			_ = manager.Close()
+		}
+		return fmt.Errorf("client closed")
+	}
 	c.responses = responses
 	c.connected = true
 	shouldStart := !c.workerStarted
@@ -592,7 +616,6 @@ func (c *Client) workerLoop() {
 
 		c.mu.Lock()
 		if c.closed {
-			c.replayDone.Broadcast()
 			c.mu.Unlock()
 			return
 		}
@@ -1205,6 +1228,7 @@ func (c *Client) onProtocolFailure(err error) {
 
 	c.connected = false
 	c.reconnecting = true
+	c.replayCh = make(chan struct{})
 	c.lastTransition = nil
 	c.transitionChunks = map[string]*transitionChunkBuffer{}
 	c.outboundQueue = nil
@@ -1227,7 +1251,6 @@ func (c *Client) reconnectLoop(reason string, observed uint64) {
 	for {
 		c.mu.Lock()
 		if c.closed {
-			c.replayDone.Broadcast()
 			c.mu.Unlock()
 			return
 		}
@@ -1276,7 +1299,10 @@ func (c *Client) reconnectLoop(reason string, observed uint64) {
 
 		c.mu.Lock()
 		c.reconnecting = false
-		c.replayDone.Broadcast()
+		if c.replayCh != nil {
+			close(c.replayCh)
+			c.replayCh = nil
+		}
 		c.mu.Unlock()
 		return
 	}
